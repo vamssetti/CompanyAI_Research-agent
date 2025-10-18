@@ -1,3 +1,8 @@
+<<<<<<< HEAD
 .env
 token.pickle
+=======
+.env
+token.pickle
+>>>>>>> 1a6aa57b7e543e75e8fa67b69091d93bfdf84728
 state.txt
