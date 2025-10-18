@@ -21,8 +21,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import base64
 from email.mime.text import MIMEText
+import base64
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,13 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Configuration (loaded from environment variables)
 API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-API_VERSION = "2025-04-01-preview"
+API_VERSION = "2025-04-01-preview"  # Restored to your working version
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "https://iit-internship2025-5.openai.azure.com/")
-DEPLOYMENT_NAME_CHAT = "gpt-5-mini"
+DEPLOYMENT_NAME_CHAT = "gpt-5-mini"  # Restored to your deployment
 DEPLOYMENT_NAME_EMBED = "text-embedding-ada-002"
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 GOOGLE_CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS")  # JSON string from environment variable
 GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/calendar.events',
@@ -48,11 +47,31 @@ CREDENTIALS_PATH = "token.pickle"  # Store Google OAuth credentials
 
 # Validate environment variables
 if not all([API_KEY, SERPAPI_KEY, TAVILY_API_KEY, GOOGLE_CLIENT_SECRETS]):
-    raise ValueError("Missing required environment variables")
+    raise ValueError(f"Missing required environment variables: "
+                     f"AZURE_OPENAI_API_KEY={bool(API_KEY)}, "
+                     f"SERPAPI_KEY={bool(SERPAPI_KEY)}, "
+                     f"TAVILY_API_KEY={bool(TAVILY_API_KEY)}, "
+                     f"GOOGLE_CLIENT_SECRETS={bool(GOOGLE_CLIENT_SECRETS)}")
+
+# Ensure TAVILY_API_KEY is set in environment (optional, as Render should already set it)
+if TAVILY_API_KEY:
+    os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
+else:
+    raise ValueError("TAVILY_API_KEY is not set")
 
 # Initialize LLM and embeddings
-llm = AzureChatOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment_name=DEPLOYMENT_NAME_CHAT)
-embeddings = AzureOpenAIEmbeddings(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment=DEPLOYMENT_NAME_EMBED) if DEPLOYMENT_NAME_EMBED else None
+llm = AzureChatOpenAI(
+    azure_endpoint=AZURE_ENDPOINT,
+    api_key=API_KEY,
+    api_version=API_VERSION,
+    deployment_name=DEPLOYMENT_NAME_CHAT
+)
+embeddings = AzureOpenAIEmbeddings(
+    azure_endpoint=AZURE_ENDPOINT,
+    api_key=API_KEY,
+    api_version=API_VERSION,
+    deployment=DEPLOYMENT_NAME_EMBED
+) if DEPLOYMENT_NAME_EMBED else None
 
 # Google API credentials
 creds = None
@@ -76,7 +95,7 @@ async def auth():
     flow = Flow.from_client_config(
         json.loads(GOOGLE_CLIENT_SECRETS),
         scopes=GOOGLE_SCOPES,
-        redirect_uri='https://agentai-api.onrender.com/oauth2callback'  # Update with your Render app URL after Step 2
+        redirect_uri='https://agentai-api-vamsi.onrender.com/oauth2callback'
     )
     auth_url, state = flow.authorization_url(prompt='consent')
     with open("state.txt", "w") as f:
@@ -94,7 +113,7 @@ async def oauth2callback(code: str, state: str):
     flow = Flow.from_client_config(
         json.loads(GOOGLE_CLIENT_SECRETS),
         scopes=GOOGLE_SCOPES,
-        redirect_uri='https://agentai-api.onrender.com/oauth2callback'  # Update with your Render app URL
+        redirect_uri='https://agentai-api-vamsi.onrender.com/oauth2callback'
     )
     flow.fetch_token(code=code)
     global creds
