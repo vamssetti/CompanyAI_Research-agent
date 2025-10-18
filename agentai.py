@@ -1,18 +1,13 @@
-
-!pip install --quiet --upgrade langchain langchain-community langgraph langgraph-checkpoint-sqlite langchain-tavily langchain-openai openai faiss-cpu requests google-auth-oauthlib google-api-python-client beautifulsoup4 serpapi tldextract
-
-# @title Set Up Environment and Import Libraries
 import os
-import re
 import json
-import time
 import requests
 from typing import List, Dict, TypedDict
-from bs4 import BeautifulSoup
-import urllib.parse
 from datetime import datetime
-
-# Azure OpenAI and LangChain imports
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse
+import logging
+import pickle
 from openai import AzureOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -23,73 +18,90 @@ from langchain.tools import tool
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-
-# Google API imports
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import base64
 from email.mime.text import MIMEText
-# Configuration
-API_KEY = "api key"
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration (loaded from environment variables)
+API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 API_VERSION = "2025-04-01-preview"
-AZURE_ENDPOINT = "https://iit-internship2025-5.openai.azure.com/"
+AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "https://iit-internship2025-5.openai.azure.com/")
 DEPLOYMENT_NAME_CHAT = "gpt-5-mini"
 DEPLOYMENT_NAME_EMBED = "text-embedding-ada-002"
-SERPAPI_KEY = "key"
-TAVILY_API_KEY = "key"  # Replace with your actual Tavily API key!
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
-GOOGLE_CLIENT_SECRETS = "xxxxxxx.json"
+GOOGLE_CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS")  # JSON string from environment variable
 GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/calendar',
-    'https://www.googleapis.com/auth/gmail.send'  # Added for sending emails
+    'https://www.googleapis.com/auth/gmail.send'
 ]
 COMMONLY_BLOCKED_DOMAINS = ['linkedin.com', 'crunchbase.com', 'bloomberg.com', 'wsj.com', 'ft.com']
+CREDENTIALS_PATH = "token.pickle"  # Store Google OAuth credentials
 
+# Validate environment variables
+if not all([API_KEY, SERPAPI_KEY, TAVILY_API_KEY, GOOGLE_CLIENT_SECRETS]):
+    raise ValueError("Missing required environment variables")
 
-
-# State Definition
-class AgentState(TypedDict):
-    company: str
-    research_data: List[Dict]
-    summary: str
-    recent_projects: str
-    contacts: Dict
-    meet_details: Dict
-    trip_itinerary: Dict
-
-# Initialize LLM and Tools
+# Initialize LLM and embeddings
 llm = AzureChatOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment_name=DEPLOYMENT_NAME_CHAT)
 embeddings = AzureOpenAIEmbeddings(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment=DEPLOYMENT_NAME_EMBED) if DEPLOYMENT_NAME_EMBED else None
 
-# Global credential storage
+# Google API credentials
 creds = None
-
 def get_credentials():
     global creds
-    if creds and creds.valid:
-        return creds
-    
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            flow = Flow.from_client_secrets_file(
-                GOOGLE_CLIENT_SECRETS,
-                scopes=GOOGLE_SCOPES,
-                redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-            )
-            auth_url, _ = flow.authorization_url(prompt='consent')
-            print(f"Attempt {attempt + 1}/{max_attempts}: Please go to this URL and authorize: {auth_url}")
-            code = input("Enter the authorization code: ")
-            flow.fetch_token(code=code)
-            creds = flow.credentials
-            return creds
-        except Exception as e:
-            print(f"Error: {str(e)}. Please try again or check the code.")
-            if attempt == max_attempts - 1:
-                print("Max attempts reached. Please restart the runtime and try again.")
-    return None
+    if os.path.exists(CREDENTIALS_PATH):
+        with open(CREDENTIALS_PATH, "rb") as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        raise HTTPException(status_code=401, detail="Credentials not available. Visit /auth to authenticate.")
+    return creds
+
+# Initialize FastAPI app
+app = FastAPI(title="AgentAI API", description="API for integrating AI agent with mobile apps")
+
+# OAuth endpoints
+@app.get("/auth")
+async def auth():
+    if not GOOGLE_CLIENT_SECRETS:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_SECRETS not configured")
+    flow = Flow.from_client_config(
+        json.loads(GOOGLE_CLIENT_SECRETS),
+        scopes=GOOGLE_SCOPES,
+        redirect_uri='https://agentai-api.onrender.com/oauth2callback'  # Update with your Render app URL after Step 2
+    )
+    auth_url, state = flow.authorization_url(prompt='consent')
+    with open("state.txt", "w") as f:
+        f.write(state)
+    return RedirectResponse(auth_url)
+
+@app.get("/oauth2callback")
+async def oauth2callback(code: str, state: str):
+    if not GOOGLE_CLIENT_SECRETS:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_SECRETS not configured")
+    with open("state.txt", "r") as f:
+        saved_state = f.read()
+    if state != saved_state:
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
+    flow = Flow.from_client_config(
+        json.loads(GOOGLE_CLIENT_SECRETS),
+        scopes=GOOGLE_SCOPES,
+        redirect_uri='https://agentai-api.onrender.com/oauth2callback'  # Update with your Render app URL
+    )
+    flow.fetch_token(code=code)
+    global creds
+    creds = flow.credentials
+    with open(CREDENTIALS_PATH, "wb") as token:
+        pickle.dump(creds, token)
+    return {"status": "Authentication successful"}
 
 # Tools
 @tool
@@ -146,6 +158,8 @@ def schedule_meet(title: str, start_time: str, end_time: str, attendees: List[st
     global creds
     if not creds or not creds.valid:
         creds = get_credentials()
+        if not creds:
+            return {"error": "Failed to obtain valid credentials"}
     try:
         service = build('calendar', 'v3', credentials=creds)
         event = {
@@ -166,6 +180,8 @@ def send_email(to: str, subject: str, body: str) -> Dict:
     global creds
     if not creds or not creds.valid:
         creds = get_credentials()
+        if not creds:
+            return {"error": "Failed to obtain valid credentials"}
     try:
         service = build('gmail', 'v1', credentials=creds)
         message = MIMEText(body)
@@ -190,35 +206,53 @@ def plan_trip(origin: str, destination: str, depart_date: str, return_date: str)
         return {'error': str(e)}
 
 # Agent Workflow
+class AgentState(TypedDict):
+    company: str
+    research_data: List[Dict]
+    summary: str
+    recent_projects: str
+    contacts: Dict
+    meet_details: Dict
+    trip_itinerary: Dict
+
 tools = [search_web, fetch_wikipedia, fetch_recent_projects, schedule_meet, send_email, plan_trip]
 memory = MemorySaver()
 agent_executor = create_react_agent(llm, tools, checkpointer=memory)
 
-# Interactive Chat Function
-def chat_with_agent():
-    current_time = datetime(2025, 10, 16, 8, 32)  # 08:32 AM IST, October 16, 2025
-    formatted_time = current_time.strftime("%I:%M %p IST on %B %d, %Y (%A)")
-    
-    thread_id = input("Enter a unique thread ID for this conversation (e.g., otsuka_chat): ")
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    print(f"\nChat with the Agent! Current date and time is {formatted_time}. Type 'ok i am done' to stop.")
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() == 'ok i am done':
-            print("Agent: Goodbye! I'm here if you need me later.")
-            break
-        
-        input_message = {"messages": [{"role": "user", "content": user_input}]}
-        
-        print("Agent thinking...")
+# Endpoint for chatting with the agent
+@app.post("/chat")
+async def chat(request: Request):
+    try:
+        data = await request.json()
+        thread_id = data.get("thread_id")
+        user_message = data.get("message")
+        if not thread_id or not user_message:
+            logger.error("Missing thread_id or message in request")
+            raise HTTPException(status_code=400, detail="Missing thread_id or message")
+        config = {"configurable": {"thread_id": thread_id}}
+        input_message = {"messages": [{"role": "user", "content": user_message}]}
+        response_content = ""
+        logger.info(f"Processing message: {user_message} for thread_id: {thread_id}")
         for step in agent_executor.stream(input_message, config, stream_mode="values"):
             for msg in step["messages"]:
                 if hasattr(msg, "content") and msg.content:
-                    print(f"Agent: {msg.content}")
+                    response_content += msg.content + "\n"
                 elif hasattr(msg, "tool_calls") and msg.tool_calls:
-                    print(f"Agent: Tool Call - {msg.tool_calls}")
+                    response_content += f"Tool Call: {json.dumps(msg.tool_calls)}\n"
                 elif hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("tool_calls"):
-                    print(f"Agent: Tool Call - {msg.additional_kwargs['tool_calls']}")
-                else:
-                    print(f"Agent: {step}")
+                    response_content += f"Tool Call: {json.dumps(msg.additional_kwargs['tool_calls'])}\n"
+        logger.info("Request processed successfully")
+        return {"response": response_content.strip()}
+    except Exception as e:
+        logger.error(f"Error in /chat endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+# Health check endpoint
+@app.get("/health")
+def health():
+    logger.info("Health check requested")
+    return {"status": "API is running"}
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))  # Render sets PORT
+    uvicorn.run(app, host="0.0.0.0", port=port)
