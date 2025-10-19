@@ -1,13 +1,18 @@
+# Cell 1: Install required libraries
+!pip install --quiet fastapi uvicorn nest_asyncio pyngrok langchain langchain-community langgraph langchain-openai openai google-auth-oauthlib google-api-python-client beautifulsoup4 serpapi tldextract requests langchain-tavily
+
+# Cell 2: Imports
 import os
 import json
 import requests
 from typing import List, Dict, TypedDict
-from datetime import datetime
+from fastapi import FastAPI, Request
+import nest_asyncio
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse
-import logging
-import pickle
+from pyngrok import ngrok
+from datetime import datetime
+import asyncio
+# LangChain, LangGraph and OpenAI imports
 from openai import AzureOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -18,109 +23,71 @@ from langchain.tools import tool
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
+# Google API imports
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from email.mime.text import MIMEText
 import base64
+from email.mime.text import MIMEText
+from google.colab import userdata
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Configuration (loaded from environment variables)
-API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-API_VERSION = "2025-04-01-preview"  # Restored to your working version
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "https://iit-internship2025-5.openai.azure.com/")
-DEPLOYMENT_NAME_CHAT = "gpt-5-mini"  # Restored to your deployment
+# Cell 3: Configuration
+API_KEY = userdata.get('AZURE_API_KEY')
+API_VERSION = "2025-04-01-preview"
+AZURE_ENDPOINT = "https://iit-internship2025-5.openai.azure.com/"
+DEPLOYMENT_NAME_CHAT = "gpt-5-mini"
 DEPLOYMENT_NAME_EMBED = "text-embedding-ada-002"
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-GOOGLE_CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS")  # JSON string from environment variable
+SERPAPI_KEY = userdata.get('SERPAPI_KEY')
+TAVILY_API_KEY = userdata.get('TAVILY_API_KEY')
+os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
+GOOGLE_CLIENT_SECRETS = "/content/client_secret_42550855283-4lcg1rbn9ceg7s6j7ufot6o510ckbocm.apps.googleusercontent.com.json"  # Replace with path to your secrets file
 GOOGLE_SCOPES = [
     'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/gmail.send'
 ]
 COMMONLY_BLOCKED_DOMAINS = ['linkedin.com', 'crunchbase.com', 'bloomberg.com', 'wsj.com', 'ft.com']
-CREDENTIALS_PATH = "token.pickle"  # Store Google OAuth credentials
+os.environ["NGROK_AUTHTOKEN"] = "33xZwoPZLJ5Dtkh83ZwCYFqEAsv_7k7LdBDg3tUPAkx7m7Xwp"  # Replace with your actual ngrok token
 
-# Validate environment variables
-if not all([API_KEY, SERPAPI_KEY, TAVILY_API_KEY, GOOGLE_CLIENT_SECRETS]):
-    raise ValueError(f"Missing required environment variables: "
-                     f"AZURE_OPENAI_API_KEY={bool(API_KEY)}, "
-                     f"SERPAPI_KEY={bool(SERPAPI_KEY)}, "
-                     f"TAVILY_API_KEY={bool(TAVILY_API_KEY)}, "
-                     f"GOOGLE_CLIENT_SECRETS={bool(GOOGLE_CLIENT_SECRETS)}")
-
-# Ensure TAVILY_API_KEY is set in environment (optional, as Render should already set it)
-if TAVILY_API_KEY:
-    os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
-else:
-    raise ValueError("TAVILY_API_KEY is not set")
+# Cell 4: Agent Setup and Tools
+# Define the AgentState TypedDict
+class AgentState(TypedDict):
+    company: str
+    research_data: List[Dict]
+    summary: str
+    recent_projects: str
+    contacts: Dict
+    meet_details: Dict
+    trip_itinerary: Dict
 
 # Initialize LLM and embeddings
-llm = AzureChatOpenAI(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=API_KEY,
-    api_version=API_VERSION,
-    deployment_name=DEPLOYMENT_NAME_CHAT
-)
-embeddings = AzureOpenAIEmbeddings(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=API_KEY,
-    api_version=API_VERSION,
-    deployment=DEPLOYMENT_NAME_EMBED
-) if DEPLOYMENT_NAME_EMBED else None
+llm = AzureChatOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment_name=DEPLOYMENT_NAME_CHAT)
+embeddings = AzureOpenAIEmbeddings(azure_endpoint=AZURE_ENDPOINT, api_key=API_KEY, api_version=API_VERSION, deployment=DEPLOYMENT_NAME_EMBED) if DEPLOYMENT_NAME_EMBED else None
 
 # Google API credentials
 creds = None
 def get_credentials():
     global creds
-    if os.path.exists(CREDENTIALS_PATH):
-        with open(CREDENTIALS_PATH, "rb") as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        raise HTTPException(status_code=401, detail="Credentials not available. Visit /auth to authenticate.")
-    return creds
+    if creds and creds.valid:
+        return creds
+    try:
+        flow = Flow.from_client_secrets_file(
+            GOOGLE_CLIENT_SECRETS,
+            scopes=GOOGLE_SCOPES,
+            redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+        )
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        print(f"Please go to this URL and authorize: {auth_url}")
+        code = input("Enter the authorization code: ")
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        return creds
+    except Exception as e:
+        print(f"Error: {str(e)}. Please check the code or secrets file.")
+        return None
 
-# Initialize FastAPI app
-app = FastAPI(title="AgentAI API", description="API for integrating AI agent with mobile apps")
-
-# OAuth endpoints
-@app.get("/auth")
-async def auth():
-    if not GOOGLE_CLIENT_SECRETS:
-        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_SECRETS not configured")
-    flow = Flow.from_client_config(
-        json.loads(GOOGLE_CLIENT_SECRETS),
-        scopes=GOOGLE_SCOPES,
-        redirect_uri='https://agentai-api-vamsi.onrender.com/oauth2callback'
-    )
-    auth_url, state = flow.authorization_url(prompt='consent')
-    with open("state.txt", "w") as f:
-        f.write(state)
-    return RedirectResponse(auth_url)
-
-@app.get("/oauth2callback")
-async def oauth2callback(code: str, state: str):
-    if not GOOGLE_CLIENT_SECRETS:
-        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_SECRETS not configured")
-    with open("state.txt", "r") as f:
-        saved_state = f.read()
-    if state != saved_state:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
-    flow = Flow.from_client_config(
-        json.loads(GOOGLE_CLIENT_SECRETS),
-        scopes=GOOGLE_SCOPES,
-        redirect_uri='https://agentai-api-vamsi.onrender.com/oauth2callback'
-    )
-    flow.fetch_token(code=code)
-    global creds
-    creds = flow.credentials
-    with open(CREDENTIALS_PATH, "wb") as token:
-        pickle.dump(creds, token)
-    return {"status": "Authentication successful"}
+# Run get_credentials once to cache creds (run this manually before starting server)
+creds = get_credentials()
 
 # Tools
 @tool
@@ -136,7 +103,7 @@ def search_web(query: str) -> List[Dict]:
 def fetch_wikipedia(company: str) -> Dict:
     """Fetch a global company summary from Wikipedia based on the company name."""
     try:
-        search_url = "https://en.wikipedia.org/w/api.php"
+        search_url = "https://en.wikipedia.org/w/api.py"
         headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
         srsearch = f"{company} IT system integration Japan company global"
         search_params = {"action": "query", "list": "search", "srsearch": srsearch, "format": "json", "srlimit": 1}
@@ -225,53 +192,116 @@ def plan_trip(origin: str, destination: str, depart_date: str, return_date: str)
         return {'error': str(e)}
 
 # Agent Workflow
-class AgentState(TypedDict):
-    company: str
-    research_data: List[Dict]
-    summary: str
-    recent_projects: str
-    contacts: Dict
-    meet_details: Dict
-    trip_itinerary: Dict
-
 tools = [search_web, fetch_wikipedia, fetch_recent_projects, schedule_meet, send_email, plan_trip]
 memory = MemorySaver()
 agent_executor = create_react_agent(llm, tools, checkpointer=memory)
 
-# Endpoint for chatting with the agent
+# Cell 5: FastAPI Server - Fixed for Colab
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pyngrok import ngrok
+import nest_asyncio
+from threading import Thread
+import uvicorn
+import json
+
+# Allow nested event loops in Colab
+nest_asyncio.apply()
+
+# Create FastAPI app
+app = FastAPI(title="AgentAI API")
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Chat endpoint - fixed version
 @app.post("/chat")
 async def chat(request: Request):
     try:
         data = await request.json()
         thread_id = data.get("thread_id")
         user_message = data.get("message")
+
         if not thread_id or not user_message:
-            logger.error("Missing thread_id or message in request")
             raise HTTPException(status_code=400, detail="Missing thread_id or message")
+
         config = {"configurable": {"thread_id": thread_id}}
         input_message = {"messages": [{"role": "user", "content": user_message}]}
-        response_content = ""
-        logger.info(f"Processing message: {user_message} for thread_id: {thread_id}")
-        for step in agent_executor.stream(input_message, config, stream_mode="values"):
-            for msg in step["messages"]:
-                if hasattr(msg, "content") and msg.content:
-                    response_content += msg.content + "\n"
-                elif hasattr(msg, "tool_calls") and msg.tool_calls:
-                    response_content += f"Tool Call: {json.dumps(msg.tool_calls)}\n"
-                elif hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("tool_calls"):
-                    response_content += f"Tool Call: {json.dumps(msg.additional_kwargs['tool_calls'])}\n"
-        logger.info("Request processed successfully")
-        return {"response": response_content.strip()}
-    except Exception as e:
-        logger.error(f"Error in /chat endpoint: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
-# Health check endpoint
+        response_content = ""
+
+        # Debugging: check what agent_executor.stream returns
+        try:
+            for step in agent_executor.stream(input_message, config, stream_mode="values"):
+                print("DEBUG - STEP:", step)  # Print each step for inspection
+                if "messages" in step:
+                    for msg in step["messages"]:
+                        # Works if msg is dict or object
+                        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+                        if content:
+                            response_content = content  # take last content
+                            print("DEBUG - MSG CONTENT:", content)
+        except Exception as e:
+            print("DEBUG - AGENT EXECUTOR ERROR:", str(e))
+            response_content = f"Error in agent_executor: {str(e)}"
+
+        # Fallback if no content generated
+        if not response_content:
+            response_content = "Sorry, I could not generate a response."
+
+        return {"response": response_content.strip()}
+
+    except Exception as e:
+        return {"response": f"Error: {str(e)}"}
+
+
+# Health check
 @app.get("/health")
 def health():
-    logger.info("Health check requested")
     return {"status": "API is running"}
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))  # Render sets PORT
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# Kill any existing ngrok tunnels
+print("Stopping any existing tunnels...")
+ngrok.kill()
+
+# Start ngrok tunnel on port 8000
+print("\nStarting ngrok tunnel...")
+tunnel = ngrok.connect(8000, bind_tls=True)
+public_url = tunnel.public_url
+
+# Display the URL prominently
+print("\n" + "="*80)
+print("🎉 SUCCESS! YOUR API IS READY!")
+print("="*80)
+print(f"\n📋 COPY THIS URL (without /health or /chat):\n")
+print(f"    {public_url}\n")
+print(f"🔗 Test it here: {public_url}/health")
+print("\n" + "="*80)
+print("✋ IMPORTANT: Keep this cell running! Don't interrupt it.")
+print("="*80 + "\n")
+
+# Function to run uvicorn in background thread
+def run_server():
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+# Start server in background thread
+server_thread = Thread(target=run_server, daemon=True)
+server_thread.start()
+
+print("✅ Server is running in background!")
+print("📱 You can now use this URL in your app!\n")
+
+# Keep the cell running
+import time
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n🛑 Stopping server...")
+    ngrok.kill()
